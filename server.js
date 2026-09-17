@@ -1,6 +1,10 @@
 const express = require('express');
 const cors = require('cors');
-require('dotenv').config();
+
+// Load dotenv only in development
+if (process.env.NODE_ENV !== 'production') {
+  require('dotenv').config();
+}
 
 const { syncOrderTracking } = require('./src/fulfillment');
 
@@ -14,7 +18,8 @@ app.use(express.json());
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    message: 'Shopify Fulfillment Sync API'
+    message: 'Shopify Fulfillment Sync API',
+    store: process.env.SHOPIFY_STORE_URL || 'NOT SET'
   });
 });
 
@@ -85,7 +90,6 @@ app.post('/batch-sync', async (req, res) => {
       });
     }
 
-    // Small delay between orders
     await new Promise(resolve => setTimeout(resolve, 500));
   }
 
@@ -102,6 +106,7 @@ app.post('/batch-sync', async (req, res) => {
 
 app.listen(PORT, () => {
   console.log(`\n✅ Server running on port ${PORT}`);
+  console.log(`   Store  : ${process.env.SHOPIFY_STORE_URL}`);
   console.log(`   Health : GET  http://localhost:${PORT}/`);
   console.log(`   Sync   : POST http://localhost:${PORT}/sync`);
   console.log(`   Batch  : POST http://localhost:${PORT}/batch-sync\n`);
