@@ -12,13 +12,14 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json({ limit: '10mb' })); // Support larger payloads
+app.use(express.json({ limit: '50mb' })); // Support large batches
+app.use(express.urlencoded({ extended: true, limit: '50mb' }));
 
 // Health check
 app.get('/', (req, res) => {
   res.json({
     status: 'running',
-    message: 'Shopify Fulfillment Sync API',
+    message: 'Shopify Fulfillment Sync API (High Performance)',
     store: process.env.SHOPIFY_STORE_URL || 'NOT SET'
   });
 });
@@ -53,7 +54,7 @@ app.post('/sync', async (req, res) => {
   }
 });
 
-// Optimized Batch sync (Parallel Processing)
+// High-speed Parallel Batch Sync
 app.post('/batch-sync', async (req, res) => {
   const { orders } = req.body;
 
@@ -64,11 +65,11 @@ app.post('/batch-sync', async (req, res) => {
     });
   }
 
-  console.log(`\n📦 Received batch of ${orders.length} orders to fulfill...`);
+  console.log(`\n📦 [Batch Start] Processing ${orders.length} orders...`);
 
   const results = [];
   const queue = [...orders];
-  const CONCURRENCY = 3; // Process 3 orders simultaneously (Safe for Shopify)
+  const CONCURRENCY = 5; // 5 orders processed in parallel
 
   async function worker(workerId) {
     while (queue.length > 0) {
@@ -76,8 +77,6 @@ app.post('/batch-sync', async (req, res) => {
       if (!order || !order.orderName) continue;
 
       try {
-        console.log(`[Worker ${workerId}] Processing: ${order.orderName}`);
-        
         const result = await syncOrderTracking({
           orderName: order.orderName,
           trackingCompany: order.trackingCompany,
@@ -90,9 +89,9 @@ app.post('/batch-sync', async (req, res) => {
           success: true,
           data: result
         });
-        console.log(`✅ [Worker ${workerId}] Completed: ${order.orderName}`);
+        console.log(`✅ [Worker ${workerId}] Synced: ${order.orderName}`);
       } catch (error) {
-        console.error(`❌ [Worker ${workerId}] Failed ${order.orderName}:`, error.message);
+        console.error(`❌ [Worker ${workerId}] Failed: ${order.orderName} -> ${error.message}`);
         results.push({
           orderName: order.orderName,
           success: false,
@@ -100,19 +99,19 @@ app.post('/batch-sync', async (req, res) => {
         });
       }
 
-      // Small pause to prevent Shopify 429 rate limit
-      await new Promise(resolve => setTimeout(resolve, 400));
+      // 150ms buffer to respect Shopify API limits smoothly
+      await new Promise(resolve => setTimeout(resolve, 150));
     }
   }
 
-  // Run 3 workers in parallel
+  // Launch parallel workers
   const workers = Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1));
   await Promise.all(workers);
 
   const successful = results.filter(r => r.success).length;
   const failed = results.filter(r => !r.success).length;
 
-  console.log(`🎉 Batch finished! Success: ${successful}, Failed: ${failed}\n`);
+  console.log(`🎉 [Batch Done] Total: ${results.length} | Synced: ${successful} | Failed: ${failed}\n`);
 
   res.json({
     total: results.length,
@@ -122,10 +121,13 @@ app.post('/batch-sync', async (req, res) => {
   });
 });
 
-app.listen(PORT, () => {
-  console.log(`\n✅ Server running on port ${PORT}`);
+const server = app.listen(PORT, () => {
+  console.log(`\n✅ High-Performance Sync Server running on port ${PORT}`);
   console.log(`   Store  : ${process.env.SHOPIFY_STORE_URL}`);
   console.log(`   Health : GET  http://localhost:${PORT}/`);
   console.log(`   Sync   : POST http://localhost:${PORT}/sync`);
   console.log(`   Batch  : POST http://localhost:${PORT}/batch-sync\n`);
 });
+
+// Keep connection open up to 10 minutes for large batch requests
+server.setTimeout(10 * 60 * 1000);
