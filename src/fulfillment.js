@@ -1,21 +1,26 @@
 const { shopifyGET, shopifyPOST } = require('./shopify');
 const { sanitizeTracking, normalizeCourier } = require('./helpers');
 
+/**
+ * Finds an order by its exact name
+ */
 async function findOrder(orderName) {
-  const data = await shopifyGET(
-    `/orders.json?name=${orderName}&status=any`
-  );
+  const query = encodeURIComponent(orderName.trim());
+  const data = await shopifyGET(`/orders.json?name=${query}&status=any`);
+
   if (!data.orders || data.orders.length === 0) {
     throw new Error(`Order ${orderName} not found`);
   }
-  return data.orders[0];
+
+  const exact = data.orders.find(
+    o => o.name.toLowerCase() === orderName.trim().toLowerCase()
+  );
+  return exact || data.orders[0];
 }
 
 async function getFulfillmentOrders(orderId) {
-  const data = await shopifyGET(
-    `/orders/${orderId}/fulfillment_orders.json`
-  );
-  return data.fulfillment_orders;
+  const data = await shopifyGET(`/orders/${orderId}/fulfillment_orders.json`);
+  return data.fulfillment_orders || [];
 }
 
 async function sendFulfillmentRequest(fulfillmentOrderId) {
@@ -25,25 +30,18 @@ async function sendFulfillmentRequest(fulfillmentOrderId) {
       { fulfillment_request: { message: 'Please fulfill this order' } }
     );
   } catch (error) {
-    console.log('Request note:', error.message);
+    console.log(`Note for FO ${fulfillmentOrderId}:`, error.message);
   }
 }
 
-async function createFulfillment({
-  fulfillmentOrderId,
-  trackingCompany,
-  trackingNumber,
-  trackingUrl
-}) {
+async function createFulfillment({ fulfillmentOrderId, trackingCompany, trackingNumber, trackingUrl }) {
   const data = await shopifyPOST('/fulfillments.json', {
     fulfillment: {
-      line_items_by_fulfillment_order: [
-        { fulfillment_order_id: fulfillmentOrderId }
-      ],
+      line_items_by_fulfillment_order: [{ fulfillment_order_id: fulfillmentOrderId }],
       tracking_info: {
         company: normalizeCourier(trackingCompany),
         number: sanitizeTracking(trackingNumber),
-        url: trackingUrl
+        url: trackingUrl || ''
       },
       notify_customer: false
     }
@@ -51,82 +49,52 @@ async function createFulfillment({
   return data.fulfillment;
 }
 
-async function updateTracking({
-  fulfillmentId,
-  trackingCompany,
-  trackingNumber,
-  trackingUrl
-}) {
-  const data = await shopifyPOST(
-    `/fulfillments/${fulfillmentId}/update_tracking.json`,
-    {
-      fulfillment: {
-        tracking_info: {
-          company: normalizeCourier(trackingCompany),
-          number: sanitizeTracking(trackingNumber),
-          url: trackingUrl
-        },
-        notify_customer: false
-      }
+async function updateTracking({ fulfillmentId, trackingCompany, trackingNumber, trackingUrl }) {
+  const data = await shopifyPOST(`/fulfillments/${fulfillmentId}/update_tracking.json`, {
+    fulfillment: {
+      tracking_info: {
+        company: normalizeCourier(trackingCompany),
+        number: sanitizeTracking(trackingNumber),
+        url: trackingUrl || ''
+      },
+      notify_customer: false
     }
-  );
+  });
   return data.fulfillment;
 }
 
-async function syncOrderTracking({
-  orderName,
-  trackingCompany,
-  trackingNumber,
-  trackingUrl
-}) {
-  console.log(`\nSyncing ${orderName}...`);
-
+/**
+ * Syncs a single order with retry capability
+ */
+async function syncOrderTracking({ orderName, trackingCompany, trackingNumber, trackingUrl }) {
   const order = await findOrder(orderName);
-  console.log(`Found: ${order.id}`);
 
-  // Check existing active fulfillment
+  // If already fulfilled, update tracking
   if (order.fulfillments && order.fulfillments.length > 0) {
-    const existing = order.fulfillments.find(
-      f => f.status !== 'cancelled'
-    );
+    const existing = order.fulfillments.find(f => f.status !== 'cancelled');
     if (existing) {
-      console.log(`Updating existing fulfillment: ${existing.id}`);
       const updated = await updateTracking({
         fulfillmentId: existing.id,
         trackingCompany,
         trackingNumber,
         trackingUrl
       });
-      return {
-        action: 'UPDATED',
-        fulfillmentId: updated.id,
-        orderName
-      };
+      return { action: 'UPDATED', fulfillmentId: updated.id, orderName };
     }
   }
 
-  // Get fulfillment orders
   const fulfillmentOrders = await getFulfillmentOrders(order.id);
-
-  // Find open or in_progress fulfillment order
-  const openFO = fulfillmentOrders.find(
-    fo => fo.status === 'open' || fo.status === 'in_progress'
-  );
+  const openFO = fulfillmentOrders.find(fo => fo.status === 'open' || fo.status === 'in_progress');
 
   if (!openFO) {
     throw new Error(`No open fulfillment order for ${orderName}`);
   }
 
-  console.log(`FO ID: ${openFO.id} | Status: ${openFO.status} | Request: ${openFO.request_status}`);
-
-  // Send request if unsubmitted
   if (openFO.request_status === 'unsubmitted') {
-    console.log(`Sending request to Wukusy...`);
     await sendFulfillmentRequest(openFO.id);
-    await new Promise(resolve => setTimeout(resolve, 2000));
+    await new Promise(res => setTimeout(res, 1000)); // reduced wait to 1s
   }
 
-  // Create fulfillment
   const fulfillment = await createFulfillment({
     fulfillmentOrderId: openFO.id,
     trackingCompany,
@@ -134,13 +102,49 @@ async function syncOrderTracking({
     trackingUrl
   });
 
-  console.log(`✅ Done: ${fulfillment.id}`);
-
-  return {
-    action: 'CREATED',
-    fulfillmentId: fulfillment.id,
-    orderName
-  };
+  return { action: 'CREATED', fulfillmentId: fulfillment.id, orderName };
 }
 
-module.exports = { syncOrderTracking };
+/**
+ * BATCH RUNNER:
+ * Runs multiple orders concurrently with rate limiting & error isolation
+ *
+ * @param {Array} orders - Array of { orderName, trackingCompany, trackingNumber, trackingUrl }
+ * @param {number} concurrency - Max simultaneous orders (Default: 2 to keep Shopify safe)
+ */
+async function syncAllOrdersBatch(orders, concurrency = 2) {
+  console.log(`\n🚀 Starting batch fulfillment for ${orders.length} orders...`);
+  const results = [];
+  const queue = [...orders];
+
+  async function worker(workerId) {
+    while (queue.length > 0) {
+      const item = queue.shift();
+      try {
+        console.log(`[Worker ${workerId}] Processing: ${item.orderName}`);
+        const res = await syncOrderTracking(item);
+        console.log(`✅ [Worker ${workerId}] Success ${item.orderName}: ${res.action}`);
+        results.push({ ...item, status: 'SUCCESS', result: res });
+      } catch (err) {
+        console.error(`❌ [Worker ${workerId}] Failed ${item.orderName}:`, err.message);
+        // Does NOT crash the batch! Moves to the next order.
+        results.push({ ...item, status: 'FAILED', error: err.message });
+      }
+
+      // Small pause between worker requests to prevent 429 rate limit
+      await new Promise(r => setTimeout(r, 600));
+    }
+  }
+
+  // Run workers in parallel
+  const workers = Array.from({ length: concurrency }, (_, i) => worker(i + 1));
+  await Promise.all(workers);
+
+  const succeeded = results.filter(r => r.status === 'SUCCESS').length;
+  const failed = results.filter(r => r.status === 'FAILED').length;
+  console.log(`\n🎉 Batch complete! Succeeded: ${succeeded} | Failed: ${failed}`);
+
+  return results;
+}
+
+module.exports = { syncOrderTracking, syncAllOrdersBatch };

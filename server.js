@@ -12,7 +12,7 @@ const app = express();
 const PORT = process.env.PORT || 3000;
 
 app.use(cors());
-app.use(express.json());
+app.use(express.json({ limit: '10mb' })); // Support larger payloads
 
 // Health check
 app.get('/', (req, res) => {
@@ -43,7 +43,6 @@ app.post('/sync', async (req, res) => {
     });
 
     res.json({ success: true, data: result });
-
   } catch (error) {
     console.error(`Error syncing ${orderName}:`, error.message);
     res.status(500).json({
@@ -54,50 +53,69 @@ app.post('/sync', async (req, res) => {
   }
 });
 
-// Batch sync multiple orders
+// Optimized Batch sync (Parallel Processing)
 app.post('/batch-sync', async (req, res) => {
   const { orders } = req.body;
 
-  if (!orders || !Array.isArray(orders)) {
+  if (!orders || !Array.isArray(orders) || orders.length === 0) {
     return res.status(400).json({
       success: false,
-      error: 'orders array is required'
+      error: 'orders array is required and cannot be empty'
     });
   }
 
+  console.log(`\n📦 Received batch of ${orders.length} orders to fulfill...`);
+
   const results = [];
+  const queue = [...orders];
+  const CONCURRENCY = 3; // Process 3 orders simultaneously (Safe for Shopify)
 
-  for (const order of orders) {
-    try {
-      const result = await syncOrderTracking({
-        orderName        : order.orderName,
-        trackingCompany  : order.trackingCompany,
-        trackingNumber   : String(order.trackingNumber).trim(),
-        trackingUrl      : order.trackingUrl
-      });
+  async function worker(workerId) {
+    while (queue.length > 0) {
+      const order = queue.shift();
+      if (!order || !order.orderName) continue;
 
-      results.push({
-        orderName : order.orderName,
-        success   : true,
-        data      : result
-      });
+      try {
+        console.log(`[Worker ${workerId}] Processing: ${order.orderName}`);
+        
+        const result = await syncOrderTracking({
+          orderName: order.orderName,
+          trackingCompany: order.trackingCompany,
+          trackingNumber: String(order.trackingNumber || '').trim(),
+          trackingUrl: order.trackingUrl
+        });
 
-    } catch (error) {
-      results.push({
-        orderName : order.orderName,
-        success   : false,
-        error     : error.message
-      });
+        results.push({
+          orderName: order.orderName,
+          success: true,
+          data: result
+        });
+        console.log(`✅ [Worker ${workerId}] Completed: ${order.orderName}`);
+      } catch (error) {
+        console.error(`❌ [Worker ${workerId}] Failed ${order.orderName}:`, error.message);
+        results.push({
+          orderName: order.orderName,
+          success: false,
+          error: error.message
+        });
+      }
+
+      // Small pause to prevent Shopify 429 rate limit
+      await new Promise(resolve => setTimeout(resolve, 400));
     }
-
-    await new Promise(resolve => setTimeout(resolve, 500));
   }
+
+  // Run 3 workers in parallel
+  const workers = Array.from({ length: CONCURRENCY }, (_, i) => worker(i + 1));
+  await Promise.all(workers);
 
   const successful = results.filter(r => r.success).length;
   const failed = results.filter(r => !r.success).length;
 
+  console.log(`🎉 Batch finished! Success: ${successful}, Failed: ${failed}\n`);
+
   res.json({
-    total      : results.length,
+    total: results.length,
     successful,
     failed,
     results
